@@ -1,30 +1,35 @@
 """High-level review orchestration."""
 import logging
-from typing import Optional
 from agent import get_agent
-from prompts import USER_TEMPLATE
+from prompts import USER_TEMPLATE, DRY_RUN_SUFFIX
+from config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
+class ReviewError(Exception):
+    pass
+
+
 def review_pr(repo: str, pr_number: int, dry_run: bool = False) -> dict:
-    """Run the agent to review a PR.
+    """Run the agent to review a PR."""
+    settings = get_settings()
     
-    Args:
-        repo: 'owner/name' format
-        pr_number: PR number
-        dry_run: If True, agent is told NOT to post the review
+    # Safety: repo allowlist
+    if settings.allowed_repos_set and repo not in settings.allowed_repos_set:
+        raise ReviewError(f"Repository '{repo}' is not in the allowlist")
     
-    Returns:
-        Dict with the agent's output and metadata.
-    """
+    # Force dry-run if configured
+    if settings.default_dry_run:
+        dry_run = True
+    
     logger.info(f"Starting review for {repo}#{pr_number} (dry_run={dry_run})")
     
     user_input = USER_TEMPLATE.format(repo=repo, pr_number=pr_number)
     if dry_run:
-        user_input += "\n\nIMPORTANT: This is a dry run. Do NOT post anything to GitHub. Just return your review as a string."
+        user_input += DRY_RUN_SUFFIX
     
-    agent = get_agent()
+    agent = get_agent(read_only=dry_run)
     result = agent.invoke({"input": user_input})
     
     return {
@@ -32,4 +37,5 @@ def review_pr(repo: str, pr_number: int, dry_run: bool = False) -> dict:
         "pr_number": pr_number,
         "review": result["output"],
         "steps_taken": len(result.get("intermediate_steps", [])),
+        "dry_run": dry_run,
     }

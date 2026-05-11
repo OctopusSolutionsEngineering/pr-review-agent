@@ -30,7 +30,7 @@ Your goal: provide thorough, constructive, and actionable code review feedback.
 ## Output Format for the Final Review
 Structure your review comment as:
 
-"""
+```
 🤖 Automated Code Review
 Summary
 <2-3 sentence overview>
@@ -44,6 +44,7 @@ Summary
 <positive observations>
 Verdict
 <APPROVE / REQUEST_CHANGES / COMMENT with reasoning>
+```
 
 ## Decision Rules
 - Use `event="REQUEST_CHANGES"` only for critical bugs/security issues

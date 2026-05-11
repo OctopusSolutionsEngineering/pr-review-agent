@@ -1,63 +1,67 @@
-"""Tools the agent uses to interact with GitHub."""
-import os
-from typing import Optional
+"""GitHub tools with caching."""
+import logging
+import requests
 from github import Github, Auth
 from langchain_core.tools import tool
-from unidiff import PatchSet
+
+from config import get_settings
+from cache import get_cache, make_cache_key
+
+logger = logging.getLogger(__name__)
 
 
 def _get_github_client() -> Github:
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise ValueError("GITHUB_TOKEN environment variable not set")
+    token = get_settings().github_token
     return Github(auth=Auth.Token(token))
 
 
-@tool
-def get_pr_metadata(repo: str, pr_number: int) -> dict:
-    """Fetch metadata about a pull request.
+def _cached_call(namespace: str, ttl: int, fn, *args, **kwargs):
+    """Wrap a function call with cache lookup."""
+    settings = get_settings()
+    if not settings.enable_tool_cache:
+        return fn(*args, **kwargs)
     
-    Args:
-        repo: Repository in 'owner/name' format (e.g., 'octocat/hello-world').
-        pr_number: The PR number.
+    cache = get_cache()
+    key = make_cache_key(namespace, *args, **kwargs)
+    cached = cache.get(key)
+    if cached is not None:
+        logger.info(f"🎯 Cache HIT: {namespace}")
+        return cached
     
-    Returns:
-        Dict with title, description, author, base/head branches, and stats.
-    """
+    logger.info(f"💨 Cache MISS: {namespace}")
+    result = fn(*args, **kwargs)
+    if isinstance(result, dict) and "error" not in result:
+        cache.set(key, result, ttl)
+    return result
+
+
+# ===== Inner implementations =====
+
+def _fetch_pr_metadata(repo: str, pr_number: int) -> dict:
     try:
-        gh = _get_github_client()
-        pr = gh.get_repo(repo).get_pull(pr_number)
+        pr = _get_github_client().get_repo(repo).get_pull(pr_number)
         return {
             "title": pr.title,
             "description": pr.body or "",
             "author": pr.user.login,
             "base_branch": pr.base.ref,
             "head_branch": pr.head.ref,
+            "head_sha": pr.head.sha,
             "state": pr.state,
+            "draft": pr.draft,
             "additions": pr.additions,
             "deletions": pr.deletions,
             "changed_files": pr.changed_files,
+            "labels": [l.name for l in pr.labels],
             "url": pr.html_url,
         }
     except Exception as e:
         return {"error": f"Failed to get PR metadata: {str(e)}"}
 
 
-@tool
-def get_pr_diff(repo: str, pr_number: int, max_chars: int = 30000) -> dict:
-    """Fetch the unified diff of a pull request.
-    
-    Args:
-        repo: Repository in 'owner/name' format.
-        pr_number: The PR number.
-        max_chars: Maximum characters to return (truncates large diffs).
-    
-    Returns:
-        Dict with the diff text and a truncation flag.
-    """
+def _fetch_pr_diff(repo: str, pr_number: int, max_chars: int) -> dict:
     try:
-        import requests
-        token = os.getenv("GITHUB_TOKEN")
+        token = get_settings().github_token
         url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
         headers = {
             "Authorization": f"Bearer {token}",
@@ -66,61 +70,35 @@ def get_pr_diff(repo: str, pr_number: int, max_chars: int = 30000) -> dict:
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         diff = response.text
-        truncated = len(diff) > max_chars
         return {
             "diff": diff[:max_chars],
-            "truncated": truncated,
+            "truncated": len(diff) > max_chars,
             "total_chars": len(diff),
         }
     except Exception as e:
         return {"error": f"Failed to get diff: {str(e)}"}
 
 
-@tool
-def list_changed_files(repo: str, pr_number: int) -> dict:
-    """List all files changed in a PR with per-file stats.
-    
-    Args:
-        repo: Repository in 'owner/name' format.
-        pr_number: The PR number.
-    
-    Returns:
-        List of files with filename, status, additions, deletions, and patch.
-    """
+def _fetch_pr_files(repo: str, pr_number: int) -> dict:
     try:
-        gh = _get_github_client()
-        pr = gh.get_repo(repo).get_pull(pr_number)
+        pr = _get_github_client().get_repo(repo).get_pull(pr_number)
         files = []
         for f in pr.get_files():
             files.append({
                 "filename": f.filename,
-                "status": f.status,  # added, modified, removed, renamed
+                "status": f.status,
                 "additions": f.additions,
                 "deletions": f.deletions,
-                "patch": (f.patch or "")[:5000],  # truncate huge patches
+                "patch": (f.patch or "")[:5000],
             })
         return {"files": files, "count": len(files)}
     except Exception as e:
         return {"error": f"Failed to list files: {str(e)}"}
 
 
-@tool
-def get_file_content(repo: str, path: str, ref: str) -> dict:
-    """Get the full content of a file at a specific commit/branch.
-    
-    Useful for understanding context beyond the diff.
-    
-    Args:
-        repo: Repository in 'owner/name' format.
-        path: File path within the repo.
-        ref: Branch name or commit SHA.
-    
-    Returns:
-        Dict with the file content (truncated if very large).
-    """
+def _fetch_file_content(repo: str, path: str, ref: str) -> dict:
     try:
-        gh = _get_github_client()
-        content = gh.get_repo(repo).get_contents(path, ref=ref)
+        content = _get_github_client().get_repo(repo).get_contents(path, ref=ref)
         text = content.decoded_content.decode("utf-8", errors="replace")
         return {
             "path": path,
@@ -131,6 +109,62 @@ def get_file_content(repo: str, path: str, ref: str) -> dict:
     except Exception as e:
         return {"error": f"Failed to get file: {str(e)}"}
 
+
+# ===== Cached tool wrappers =====
+
+@tool
+def get_pr_metadata(repo: str, pr_number: int) -> dict:
+    """Fetch metadata about a pull request.
+    
+    Args:
+        repo: Repository in 'owner/name' format.
+        pr_number: The PR number.
+    """
+    ttl = get_settings().cache_ttl_pr_metadata
+    return _cached_call("pr_metadata", ttl, _fetch_pr_metadata, repo, pr_number)
+
+
+@tool
+def get_pr_diff(repo: str, pr_number: int) -> dict:
+    """Fetch the unified diff of a pull request.
+    
+    Args:
+        repo: Repository in 'owner/name' format.
+        pr_number: The PR number.
+    """
+    settings = get_settings()
+    return _cached_call(
+        "pr_diff", settings.cache_ttl_pr_diff,
+        _fetch_pr_diff, repo, pr_number, settings.max_diff_chars,
+    )
+
+
+@tool
+def list_changed_files(repo: str, pr_number: int) -> dict:
+    """List all files changed in a PR with per-file stats.
+    
+    Args:
+        repo: Repository in 'owner/name' format.
+        pr_number: The PR number.
+    """
+    ttl = get_settings().cache_ttl_pr_files
+    return _cached_call("pr_files", ttl, _fetch_pr_files, repo, pr_number)
+
+
+@tool
+def get_file_content(repo: str, path: str, ref: str) -> dict:
+    """Get the full content of a file at a specific commit/branch.
+    
+    Args:
+        repo: Repository in 'owner/name' format.
+        path: File path within the repo.
+        ref: Branch name or commit SHA.
+    """
+    ttl = get_settings().cache_ttl_file_content
+    return _cached_call("file_content", ttl, _fetch_file_content, repo, path, ref)
+
+
+# ===== Write tools (NOT cached) =====
 
 @tool
 def post_review_comment(
@@ -146,15 +180,11 @@ def post_review_comment(
         pr_number: The PR number.
         body: The review body (markdown supported).
         event: One of 'COMMENT', 'APPROVE', or 'REQUEST_CHANGES'.
-    
-    Returns:
-        Dict confirming the post.
     """
     if event not in {"COMMENT", "APPROVE", "REQUEST_CHANGES"}:
         return {"error": f"Invalid event: {event}"}
     try:
-        gh = _get_github_client()
-        pr = gh.get_repo(repo).get_pull(pr_number)
+        pr = _get_github_client().get_repo(repo).get_pull(pr_number)
         review = pr.create_review(body=body, event=event)
         return {
             "success": True,
@@ -179,23 +209,15 @@ def post_inline_comment(
     Args:
         repo: Repository in 'owner/name' format.
         pr_number: The PR number.
-        body: The comment text (markdown supported).
+        body: The comment text.
         file_path: The file to comment on.
-        line: The line number in the diff (RIGHT side / new file).
-    
-    Returns:
-        Dict confirming the post.
+        line: Line number (RIGHT side / new file).
     """
     try:
-        gh = _get_github_client()
-        pr = gh.get_repo(repo).get_pull(pr_number)
-        commit = pr.get_commits().reversed[0]  # latest commit
+        pr = _get_github_client().get_repo(repo).get_pull(pr_number)
+        commit = pr.get_commits().reversed[0]
         comment = pr.create_review_comment(
-            body=body,
-            commit=commit,
-            path=file_path,
-            line=line,
-            side="RIGHT",
+            body=body, commit=commit, path=file_path, line=line, side="RIGHT",
         )
         return {"success": True, "comment_id": comment.id, "url": comment.html_url}
     except Exception as e:
@@ -209,4 +231,12 @@ REVIEW_TOOLS = [
     get_file_content,
     post_review_comment,
     post_inline_comment,
+]
+
+# Read-only tool subset (for dry-run and inter-agent calls)
+READ_ONLY_TOOLS = [
+    get_pr_metadata,
+    get_pr_diff,
+    list_changed_files,
+    get_file_content,
 ]
